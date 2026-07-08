@@ -33,6 +33,21 @@ touch the repo.
    (`pre-commit = [".githooks/check.sh"]`). Scripts still run via `sh -c`, so
    arguments and shell substitution work as normal.
 
+Either form may be written as a bare string or as an inline table that adds
+staged-file awareness:
+
+```toml
+pre-commit = [{ run = "rustfmt --check {staged_files}", glob = "*.rs" }]
+```
+
+`{staged_files}` expands to the shell-quoted list of staged files
+(`git diff --cached --name-only --diff-filter=ACMR`). An optional `glob` filters
+that list first; with a glob and no matching staged files the command is skipped
+entirely. The glob is deliberately tiny: `*` matches any run of characters
+except `/`, `**` matches across `/`, and `?` matches one character — so `*.rs`
+matches `main.rs` but not `src/main.rs` (use `**/*.rs` for nested paths). The
+table form is covered by the consent hash exactly like the string form.
+
 ## What the consent hash covers
 
 The hash bound to your decision is:
@@ -97,6 +112,23 @@ Run it as a reviewed pipeline step after you have inspected the hooks. If the
 committed hooks change, a stale `accept` no longer matches the new hash, so the
 hooks are skipped (safe-off) until someone re-accepts — CI fails open to *not
 running*, not to running unknown code.
+
+### `GIT_HOOKS_CONSENT` (non-interactive override)
+
+For pipelines that cannot run `git hooks accept` (ephemeral checkouts, container
+builds), set the environment variable `GIT_HOOKS_CONSENT`:
+
+- `GIT_HOOKS_CONSENT=accept` — run the hooks regardless of stored consent.
+- `GIT_HOOKS_CONSENT=decline` — skip the hooks regardless of stored consent.
+- `GIT_HOOKS_CONSENT=accept:<hash>` — run **only if** `<hash>` matches the
+  current content hash (the value shown by `git hooks status`). This is the
+  reproducible, pinned form: the moment the committed hooks change, the pinned
+  hash no longer matches and the hooks fall back to normal (safe-off) behavior.
+
+The override applies to that single invocation and is **never persisted** to
+`.git/config`. Prefer the pinned `accept:<hash>` form. Plain `accept` disables
+the content check entirely, so use it only in environments you fully control and
+whose repository contents you trust.
 
 ## Comparison note
 

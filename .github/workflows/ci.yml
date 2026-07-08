@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # GitHub runners ship a stable Rust toolchain, so no setup action needed.
+      - name: Build
+        run: cargo build --release --verbose
+      # The e2e tests are gated to Linux (they need setsid to drop the TTY);
+      # on macOS/Windows this just confirms the crate compiles and links.
+      - name: Test
+        run: cargo test --verbose

@@ -6,6 +6,11 @@
 //! runs under `setsid -w`, which detaches the controlling terminal: opening
 //! /dev/tty then fails, so the consent prompt is never interactive and tests
 //! are deterministic. Explicit `git hooks accept`/`decline` drive consent.
+//!
+//! Linux-only: the sandbox depends on `setsid -w` to drop the controlling
+//! terminal, which isn't available by default on macOS/Windows. CI on those
+//! platforms just does `cargo build` + `cargo test` (this file compiles away).
+#![cfg(target_os = "linux")]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -68,6 +73,33 @@ impl Sandbox {
 
     fn hooks_in(&self, args: &[&str], cwd: &Path) -> Output {
         self.run_in("git-hooks", args, cwd)
+    }
+
+    /// Like `run_in`, but with extra environment variables (e.g.
+    /// GIT_HOOKS_CONSENT). Same isolated HOME/PATH and detached TTY.
+    fn run_in_env(&self, program: &str, args: &[&str], cwd: &Path, extra: &[(&str, &str)]) -> Output {
+        let path = format!(
+            "{}:{}",
+            self.bindir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = Command::new("setsid");
+        cmd.arg("-w")
+            .arg(program)
+            .args(args)
+            .current_dir(cwd)
+            .env("HOME", &self.home)
+            .env("PATH", path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(Stdio::null());
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        cmd.output().expect("spawn setsid")
+    }
+
+    fn hooks_in_env(&self, args: &[&str], cwd: &Path, extra: &[(&str, &str)]) -> Output {
+        self.run_in_env("git-hooks", args, cwd, extra)
     }
 
     /// Global install: shims + init.templateDir.
@@ -336,5 +368,146 @@ fn script_executes_and_exit_code_propagates() {
         "script stdout should surface: {} / {}",
         out(&run),
         err(&run)
+    );
+}
+
+// `git hooks init` copies shims into an already-cloned repo but never clobbers
+// a foreign hook.
+#[test]
+fn init_adopts_shims_and_refuses_to_clobber() {
+    let sb = Sandbox::new();
+    let repo = sb.root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    // init BEFORE install, so no templateDir is set and the repo has no shims.
+    sb.git_in(&["init"], &repo);
+    sb.install();
+
+    // A foreign pre-commit hook that must be left untouched.
+    let hooks = repo.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let foreign = "#!/bin/sh\necho FOREIGN\n";
+    write_script(&hooks.join("pre-commit"), foreign);
+
+    let o = sb.hooks_in(&["init"], &repo);
+    assert!(o.status.success(), "init failed: {}", err(&o));
+
+    // pre-commit is still the foreign hook…
+    assert_eq!(
+        fs::read_to_string(hooks.join("pre-commit")).unwrap(),
+        foreign,
+        "foreign pre-commit must not be overwritten"
+    );
+    assert!(
+        out(&o).contains("skipped") && out(&o).contains("pre-commit"),
+        "init should report the skip: {}",
+        out(&o)
+    );
+    // …but a hook with no conflict got our shim.
+    let cm = fs::read_to_string(hooks.join("commit-msg")).unwrap();
+    assert!(
+        cm.contains("git-hooks shim"),
+        "commit-msg should be our shim: {cm}"
+    );
+}
+
+// glob + {staged_files}: runs only when a matching file is staged, and the
+// command receives the staged filename; skipped when only non-matching files
+// are staged.
+#[test]
+fn glob_and_staged_files_substitution() {
+    let sb = Sandbox::new();
+    sb.install();
+    let toml = "[hooks]\npre-commit = [{ run = \"echo {staged_files} > got.txt\", glob = \"*.rs\" }]\n";
+    let origin = sb.make_origin(toml, &[]);
+    let work = sb.clone(&origin, "work");
+    sb.hooks_in(&["accept"], &work);
+
+    // Stage a .rs file → the command runs and receives it.
+    sb.stage(&work, "lib.rs", "fn main() {}\n");
+    let c1 = sb.git_in(&["commit", "-m", "rs"], &work);
+    assert!(c1.status.success(), "rs commit failed: {}", err(&c1));
+    let got = fs::read_to_string(work.join("got.txt")).expect("hook should have run");
+    assert!(
+        got.contains("lib.rs"),
+        "command should receive the staged .rs file: {got}"
+    );
+
+    // Stage only a .md file → glob has no match, command is skipped.
+    fs::remove_file(work.join("got.txt")).unwrap();
+    sb.stage(&work, "README.md", "hi\n");
+    let c2 = sb.git_in(&["commit", "-m", "md"], &work);
+    assert!(c2.status.success(), "md commit should pass: {}", err(&c2));
+    assert!(
+        !work.join("got.txt").exists(),
+        "command must be skipped when no staged file matches the glob"
+    );
+    assert!(
+        err(&c2).contains("no matching staged files"),
+        "expected skip notice: {}",
+        err(&c2)
+    );
+}
+
+// GIT_HOOKS_CONSENT overrides stored consent for one invocation, is not
+// persisted, and the pinned form only applies on a matching hash.
+#[test]
+fn env_consent_override() {
+    let sb = Sandbox::new();
+    sb.install();
+    let origin = sb.make_origin("[hooks]\npre-commit = [\"touch ran.marker\"]\n", &[]);
+    let work = sb.clone(&origin, "work");
+    let marker = work.join("ran.marker");
+
+    // No stored consent + accept env → hook runs.
+    let o1 = sb.hooks_in_env(&["run", "pre-commit"], &work, &[("GIT_HOOKS_CONSENT", "accept")]);
+    assert!(o1.status.success(), "run failed: {}", err(&o1));
+    assert!(marker.exists(), "accept env should run the hook");
+
+    // The override was not persisted.
+    let st = sb.hooks_in(&["status"], &work);
+    assert!(
+        out(&st).contains("no decision yet"),
+        "env override must not persist consent: {}",
+        out(&st)
+    );
+
+    // decline env → hook skipped.
+    fs::remove_file(&marker).unwrap();
+    let o2 = sb.hooks_in_env(&["run", "pre-commit"], &work, &[("GIT_HOOKS_CONSENT", "decline")]);
+    assert!(o2.status.success());
+    assert!(!marker.exists(), "decline env should skip the hook");
+
+    // accept:<wrong-hash> → does NOT enable; falls back to no-TTY skip.
+    let o3 = sb.hooks_in_env(
+        &["run", "pre-commit"],
+        &work,
+        &[("GIT_HOOKS_CONSENT", "accept:deadbeef")],
+    );
+    assert!(o3.status.success());
+    assert!(!marker.exists(), "wrong-hash pin must not enable the hook");
+    assert!(
+        err(&o3).contains("skipping"),
+        "wrong-hash pin should fall back to no-tty skip: {}",
+        err(&o3)
+    );
+}
+
+// The full hook list is wired into `add` validation: a hook new in M2 is
+// accepted.
+#[test]
+fn add_accepts_new_hook_name() {
+    let sb = Sandbox::new();
+    let repo = sb.root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    sb.git_in(&["init"], &repo);
+
+    let a = sb.hooks_in(&["add", "pre-merge-commit", "true"], &repo);
+    assert!(a.status.success(), "add pre-merge-commit failed: {}", err(&a));
+
+    let st = sb.hooks_in(&["status"], &repo);
+    assert!(
+        out(&st).contains("pre-merge-commit"),
+        "status should list the new hook: {}",
+        out(&st)
     );
 }

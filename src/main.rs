@@ -5,16 +5,24 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 
-// Hooks worth shimming. Add more from githooks(5) if ever needed.
+// Client-side hooks worth shimming (githooks(5)). Server-side receive hooks
+// (pre-receive/update/post-receive/post-update/proc-receive) and the very hot
+// reference-transaction hook are intentionally omitted — this is a client tool.
 const HOOKS: &[&str] = &[
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
     "pre-commit",
+    "pre-merge-commit",
     "prepare-commit-msg",
     "commit-msg",
     "post-commit",
-    "pre-push",
+    "pre-rebase",
     "post-checkout",
     "post-merge",
-    "pre-rebase",
+    "pre-push",
+    "post-rewrite",
+    "pre-auto-gc",
 ];
 
 const CONFIG_FILE: &str = ".githooks.toml";
@@ -24,11 +32,15 @@ const CONFIG_FILE: &str = ".githooks.toml";
 const HOOKS_DIR: &str = ".githooks";
 // Dir component of the consent hash when there is no {HOOKS_DIR}.
 const NO_DIR: &str = "none";
+// Marker line in every shim we write, so `init` can tell our shims from a
+// foreign hook it must not clobber.
+const SHIM_MARKER: &str = "# git-hooks shim";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("install") => install(),
+        Some("init") => init(),
         Some("uninstall") => uninstall(),
         Some("add") => add(
             args.get(1).unwrap_or_else(|| usage()),
@@ -50,6 +62,7 @@ fn usage() -> ! {
         "usage: git hooks <command>\n\
          \n\
          install                  one-time global setup (shims via init.templateDir)\n\
+         init                     copy shims into an already-cloned repo\n\
          uninstall                remove global setup\n\
          add <hook> <command>     add a command to this repo's {CONFIG_FILE}\n\
          accept | decline         record your decision for this repo's hooks\n\
@@ -63,10 +76,36 @@ fn usage() -> ! {
     exit(2);
 }
 
-// ponytail: $HOME only — Windows needs USERPROFILE, add when someone runs it there.
+/// Home directory: HOME on unix, USERPROFILE as a Windows fallback.
+fn home() -> PathBuf {
+    env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .expect("HOME/USERPROFILE not set")
+}
+
 fn template_dir() -> PathBuf {
-    PathBuf::from(env::var("HOME").expect("HOME not set"))
-        .join(".config/git-hooks/template")
+    home().join(".config/git-hooks/template")
+}
+
+/// The shim script for `hook`. Includes {SHIM_MARKER} so `init` can recognise
+/// our own hooks and refuse to overwrite foreign ones. Stays `#!/bin/sh`: git
+/// (incl. git-for-windows, which ships sh) runs hooks through a shell, and it
+/// resolves `git-hooks`/`git-hooks.exe` on PATH automatically.
+fn shim_body(hook: &str) -> String {
+    format!("#!/bin/sh\n{SHIM_MARKER}\nexec git-hooks run {hook} \"$@\"\n")
+}
+
+/// Set the executable bit (no-op off unix; Windows relies on the shebang via
+/// git's bundled sh).
+fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// One-time global setup, LFS-style: write shim hooks into a template dir and
@@ -77,14 +116,9 @@ fn install() {
     fs::create_dir_all(&hooks_dir).expect("create template dir");
 
     for hook in HOOKS {
-        let shim = format!("#!/bin/sh\nexec git-hooks run {hook} \"$@\"\n");
         let path = hooks_dir.join(hook);
-        fs::write(&path, shim).expect("write shim");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        fs::write(&path, shim_body(hook)).expect("write shim");
+        make_executable(&path);
     }
 
     git(&[
@@ -94,7 +128,71 @@ fn install() {
         template_dir().to_str().unwrap(),
     ]);
     println!("installed. new clones get hook shims automatically.");
-    println!("existing repo? run `git init` inside it to copy the shims.");
+    println!("existing repo? run `git hooks init` inside it to copy the shims.");
+}
+
+/// Adopt an already-cloned repo: copy the shims from the template dir into this
+/// repo's hooks dir. Never clobbers a foreign (non-shim) hook. Reports what was
+/// installed vs skipped.
+fn init() {
+    if repo_root().is_none() {
+        eprintln!("not inside a git repository");
+        exit(1);
+    }
+    let tmpl = template_dir().join("hooks");
+    if !tmpl.is_dir() {
+        eprintln!("no hook template found — run `git hooks install` first.");
+        exit(1);
+    }
+    let dest = hooks_path().unwrap_or_else(|| {
+        eprintln!("could not resolve this repo's hooks dir");
+        exit(1);
+    });
+    fs::create_dir_all(&dest).expect("create hooks dir");
+
+    let mut installed = Vec::new();
+    let mut skipped = Vec::new();
+    for hook in HOOKS {
+        let src = tmpl.join(hook);
+        if !src.is_file() {
+            continue;
+        }
+        let target = dest.join(hook);
+        if target.exists() {
+            let existing = fs::read_to_string(&target).unwrap_or_default();
+            if !existing.contains(SHIM_MARKER) {
+                skipped.push(*hook);
+                continue; // foreign hook — leave it alone
+            }
+        }
+        fs::copy(&src, &target).expect("copy shim");
+        make_executable(&target);
+        installed.push(*hook);
+    }
+
+    if installed.is_empty() {
+        println!("no shims installed.");
+    } else {
+        println!("installed shims: {}", installed.join(", "));
+    }
+    if !skipped.is_empty() {
+        println!(
+            "skipped (existing non-shim hook, left untouched): {}",
+            skipped.join(", ")
+        );
+    }
+}
+
+/// This repo's hooks directory (honours core.hooksPath / worktrees via
+/// `git rev-parse --git-path hooks`). The path git prints is relative to the
+/// current directory, so anchor it there.
+fn hooks_path() -> Option<PathBuf> {
+    let p = PathBuf::from(git_capture(&["rev-parse", "--git-path", "hooks"])?);
+    Some(if p.is_absolute() {
+        p
+    } else {
+        env::current_dir().ok()?.join(p)
+    })
 }
 
 fn uninstall() {
@@ -159,7 +257,7 @@ fn status() {
     });
     match fs::read_to_string(root.join(CONFIG_FILE)) {
         Ok(raw) => {
-            print!("{raw}");
+            print!("{}", render_config(&raw));
             let scripts = githooks_dir_files(&root);
             if !scripts.is_empty() {
                 println!("\ncovered scripts under {HOOKS_DIR}/:");
@@ -181,12 +279,69 @@ fn status() {
     }
 }
 
+/// A single hook command: either a plain string or an inline table
+/// `{ run = "...", glob = "*.rs" }`.
+struct HookCmd {
+    run: String,
+    glob: Option<String>,
+}
+
+/// Parse one hook-array entry. Accepts a bare string or a `{ run, glob }` table.
+fn parse_hook_cmd(v: &toml::Value) -> Option<HookCmd> {
+    if let Some(s) = v.as_str() {
+        return Some(HookCmd {
+            run: s.to_string(),
+            glob: None,
+        });
+    }
+    if let Some(t) = v.as_table() {
+        let run = t.get("run")?.as_str()?.to_string();
+        let glob = t.get("glob").and_then(|g| g.as_str()).map(String::from);
+        return Some(HookCmd { run, glob });
+    }
+    None
+}
+
+/// Human-readable rendering of the config for prompts/status. Table-form
+/// entries become `run  (glob: …)` so the reader sees the command and its
+/// filter at a glance; falls back to the raw text if it doesn't parse.
+fn render_config(raw: &str) -> String {
+    let Ok(config) = raw.parse::<toml::Table>() else {
+        return format!("{}\n", raw.trim());
+    };
+    let Some(hooks) = config.get("hooks").and_then(|h| h.as_table()) else {
+        return format!("{}\n", raw.trim());
+    };
+    let mut s = String::new();
+    for (hook, val) in hooks {
+        let Some(arr) = val.as_array() else { continue };
+        s.push_str(&format!("[{hook}]\n"));
+        for cmd in arr {
+            match parse_hook_cmd(cmd) {
+                Some(hc) => {
+                    s.push_str(&format!("  {}", hc.run));
+                    if let Some(g) = hc.glob {
+                        s.push_str(&format!("   (glob: {g})"));
+                    }
+                    s.push('\n');
+                }
+                None => s.push_str("  <unparseable entry>\n"),
+            }
+        }
+    }
+    s
+}
+
 /// Called by the shims. Runs the commands for `hook` from the repo's committed
 /// {CONFIG_FILE} — but only after the user has accepted this exact version of
 /// the hooks. First run (right after clone, via post-checkout) shows the config
 /// and prompts on /dev/tty; the decision is stored in .git/config keyed to a
 /// content hash of {CONFIG_FILE} *and* the {HOOKS_DIR}/ tree, so any change to
 /// either re-prompts.
+///
+/// `GIT_HOOKS_CONSENT` overrides stored consent for this invocation only (never
+/// persisted): `accept` / `decline` unconditionally, or `accept:<hash>` which
+/// only takes effect when it matches the current content hash.
 fn run_hook(hook: &str, hook_args: &[String]) -> i32 {
     let Some(root) = repo_root() else { return 0 };
     let Ok(raw) = fs::read_to_string(root.join(CONFIG_FILE)) else {
@@ -194,14 +349,25 @@ fn run_hook(hook: &str, hook_args: &[String]) -> i32 {
     };
     let hash = consent_hash().unwrap();
 
-    match consent_state().as_deref() {
-        Some(s) if s == format!("accept:{hash}") => {}
-        Some(s) if s == format!("decline:{hash}") => return 0,
-        _ => {
-            if !prompt_consent(&root, &raw) {
-                return 0;
-            }
-        }
+    // Env override wins over stored consent but is never written back.
+    let env_verdict = match env::var("GIT_HOOKS_CONSENT").ok().as_deref() {
+        Some("accept") => Some(true),
+        Some("decline") => Some(false),
+        // Pinned form: only honoured when the hash matches (reproducible CI).
+        Some(s) if s.strip_prefix("accept:") == Some(hash.as_str()) => Some(true),
+        _ => None, // unset, empty, or accept:<wrong-hash> → fall back to stored
+    };
+    let proceed = match env_verdict {
+        Some(true) => true,
+        Some(false) => return 0,
+        None => match consent_state().as_deref() {
+            Some(s) if s == format!("accept:{hash}") => true,
+            Some(s) if s == format!("decline:{hash}") => return 0,
+            _ => prompt_consent(&root, &raw),
+        },
+    };
+    if !proceed {
+        return 0;
     }
 
     let config: toml::Table = match raw.parse() {
@@ -219,44 +385,134 @@ fn run_hook(hook: &str, hook_args: &[String]) -> i32 {
         return 0;
     };
 
+    let staged = staged_files(&root);
+
     for cmd in cmds {
-        let Some(cmd) = cmd.as_str() else { continue };
-        eprintln!("git-hooks[{hook}]: {cmd}");
+        let Some(hc) = parse_hook_cmd(cmd) else { continue };
+
+        // If a glob is set, gate on (and substitute) only the matching staged
+        // files. No glob → all staged files are eligible for substitution.
+        let matched: Vec<String> = match &hc.glob {
+            Some(g) => staged.iter().filter(|f| glob_match(g, f)).cloned().collect(),
+            None => staged.clone(),
+        };
+        if hc.glob.is_some() && matched.is_empty() {
+            eprintln!("git-hooks[{hook}]: skipped (no matching staged files): {}", hc.run);
+            continue;
+        }
+
+        let cmd_str = if hc.run.contains("{staged_files}") {
+            hc.run.replace("{staged_files}", &shell_quote_list(&matched))
+        } else {
+            hc.run.clone()
+        };
+
+        eprintln!("git-hooks[{hook}]: {}", hc.run);
         // sh -c '<cmd>' sh <hook_args...> — git's hook args land in $1, $2...
         // A `.githooks/…` command is just a path sh runs, so scripts and inline
-        // commands share this one code path.
+        // commands share this one code path. On Windows we rely on sh being on
+        // PATH (git-for-windows puts its bundled sh there for hook execution).
         let status = Command::new("sh")
             .arg("-c")
-            .arg(cmd)
+            .arg(&cmd_str)
             .arg("sh")
             .args(hook_args)
             .current_dir(&root)
             .status()
             .expect("spawn sh");
         if !status.success() {
-            eprintln!("git-hooks[{hook}]: FAILED: {cmd}");
+            eprintln!("git-hooks[{hook}]: FAILED: {}", hc.run);
             return status.code().unwrap_or(1);
         }
     }
     0
 }
 
-/// Ask on the controlling terminal (hook stdin belongs to git, /dev/tty is the
-/// standard way to reach the user). No TTY — e.g. CI — means no consent: hooks
-/// are skipped and we say how to opt in.
+/// Staged paths (repo-relative), added/copied/modified/renamed. Empty for hooks
+/// that fire with nothing staged — callers treat that as "no files", same path.
+fn staged_files(root: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .args(["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
+        .current_dir(root)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Single-quote a path for `sh`, escaping embedded single quotes.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn shell_quote_list(files: &[String]) -> String {
+    files
+        .iter()
+        .map(|f| shell_quote(f))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Minimal glob matcher, whole-string against a repo-relative path:
+///   `*`  matches any run of characters except `/`
+///   `**` matches any run of characters including `/`
+///   `?`  matches exactly one character (not `/`)
+/// everything else is literal. Operates on bytes (fine for path matching).
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn m(p: &[u8], t: &[u8]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+        match p[0] {
+            b'*' if p.get(1) == Some(&b'*') => {
+                // `**`: try consuming any amount of text, including `/`.
+                let rest = &p[2..];
+                (0..=t.len()).any(|i| m(rest, &t[i..]))
+            }
+            b'*' => {
+                // `*`: consume text up to but not across a `/`.
+                let rest = &p[1..];
+                let mut i = 0;
+                loop {
+                    if m(rest, &t[i..]) {
+                        return true;
+                    }
+                    if i >= t.len() || t[i] == b'/' {
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
+            b'?' => !t.is_empty() && t[0] != b'/' && m(&p[1..], &t[1..]),
+            c => !t.is_empty() && t[0] == c && m(&p[1..], &t[1..]),
+        }
+    }
+    m(pattern.as_bytes(), text.as_bytes())
+}
+
+/// Ask on the controlling terminal (hook stdin belongs to git; the console
+/// device — /dev/tty on unix, CONIN$/CONOUT$ on Windows — is the standard way
+/// to reach the user). No console — e.g. CI — means no consent: hooks are
+/// skipped and we say how to opt in.
 ///
 /// First-ever prompt shows the full config + covered scripts. If a previous
 /// accept exists (a manifest), the hooks *changed*: we show a diff against the
 /// accepted version instead of dumping everything again.
 fn prompt_consent(root: &Path, raw: &str) -> bool {
-    let Ok(tty_in) = fs::File::open("/dev/tty") else {
+    let (in_dev, out_dev) = tty_devices();
+    let Ok(tty_in) = fs::File::open(in_dev) else {
         eprintln!(
             "git-hooks: this repository defines hooks in {CONFIG_FILE} (not yet accepted).\n\
              git-hooks: no terminal to ask on — skipping them. run `git hooks accept` to enable."
         );
         return false;
     };
-    let mut tty_out = fs::OpenOptions::new().write(true).open("/dev/tty").unwrap();
+    let mut tty_out = fs::OpenOptions::new().write(true).open(out_dev).unwrap();
 
     let manifest = read_manifest();
     let body = if manifest.is_empty() {
@@ -287,11 +543,22 @@ fn prompt_consent(root: &Path, raw: &str) -> bool {
     accepted
 }
 
+/// Console device paths for prompting: /dev/tty on unix, CONIN$/CONOUT$ on
+/// Windows (both open like files against the attached console).
+#[cfg(windows)]
+fn tty_devices() -> (&'static str, &'static str) {
+    ("CONIN$", "CONOUT$")
+}
+#[cfg(not(windows))]
+fn tty_devices() -> (&'static str, &'static str) {
+    ("/dev/tty", "/dev/tty")
+}
+
 /// First contact: show the whole config, plus the scripts it can reach.
 fn first_prompt_body(root: &Path, raw: &str) -> String {
     let mut s = format!(
-        "this repository wants to run the following hooks ({CONFIG_FILE}):\n\n{}\n",
-        raw.trim()
+        "this repository wants to run the following hooks ({CONFIG_FILE}):\n\n{}",
+        render_config(raw)
     );
     let scripts = githooks_dir_files(root);
     if !scripts.is_empty() {
@@ -363,8 +630,8 @@ fn runtime_ref_warning(root: &Path) -> String {
         for val in hooks.values() {
             let Some(arr) = val.as_array() else { continue };
             for cmd in arr {
-                let Some(cmd) = cmd.as_str() else { continue };
-                for tok in cmd.split_whitespace() {
+                let Some(hc) = parse_hook_cmd(cmd) else { continue };
+                for tok in hc.run.split_whitespace() {
                     if !(tok.starts_with("./") || tok.contains('/')) {
                         continue;
                     }
