@@ -94,6 +94,95 @@ Be clear-eyed about the boundary:
 - **Everything after acceptance.** Consent is a decision about specific content,
   not a sandbox. Accepted hooks run with your full user privileges.
 
+## Signed hooks
+
+Content-keyed consent is sound but noisy: a maintainer who legitimately changes
+the hooks re-prompts every teammate, every time. Signed trust removes that noise
+without weakening the boundary — you stop trusting *content* and start trusting a
+*key*, once.
+
+### What the signature covers
+
+`git hooks sign --key <ssh-key> [--signer <principal>]` signs the **canonical
+content** — the exact deterministic byte string consent is hashed from: one
+`<path>:<blob>` line for `.githooks.toml`, then one per file under `.githooks/`,
+walked in sorted order (`git hash-object` supplies the blob ids). Both signing
+and consent hashing build this string from the same function, so the signature
+covers precisely what the consent hash covers.
+
+With **one deliberate exclusion**: the signature is computed over the canonical
+content *minus anything under `.githooks/trust/`*. That directory is where the
+signature (`hooks.sig`) and the `allowed_signers` file live, and it sits inside
+the hash-covered tree. If the signature covered its own bytes, writing it would
+immediately invalidate it. So `trust/` is excluded from the *signed* content.
+
+The **consent hash still covers everything, including `trust/`.** That is
+intentional and harmless: adding or changing a signature re-keys consent (the
+content genuinely changed), which just means "re-accept the newly-signed
+content" — and for a trusted key that re-acceptance is automatic and silent.
+
+Signing pins the SSH signature namespace to exactly `git-hooks`
+(`ssh-keygen -Y sign -n git-hooks`). Verification requires the same namespace.
+This stops **cross-protocol replay**: a signature the maintainer produced for
+some other purpose (git commit signing uses `git`, other tools use their own)
+can never be presented here as a valid hooks signature, and vice versa. The
+namespace is part of what is signed, so it cannot be stripped or swapped.
+
+### Verification and trust levels
+
+On the first hook after clone, before prompting, `git-hooks` verifies
+`.githooks/trust/hooks.sig` against `.githooks/trust/allowed_signers` over the
+canonical (trust-excluded) content, trying each principal until one verifies:
+
+- **No signature files** → the original unsigned flow, byte-for-byte.
+- **Signature present but invalid** (tampered content, wrong key) → treated as
+  *unsigned*, but the prompt gains a loud `signature present but INVALID` line.
+  An invalid signature **never** auto-accepts.
+- **Valid signature** → the signing key's SHA256 fingerprint is computed and
+  checked against two trust stores, in order:
+  1. **Org policy** — `~/.config/git-hooks/policy.toml`, `trusted_keys = [...]`.
+     Pre-seeded org-wide (e.g. by config management).
+  2. **Repo-local** — `git config --local hooks.trustedKey <fingerprint>`, set
+     by answering `t` at a prompt or by `git hooks trust <fingerprint>`.
+
+  A trusted fingerprint → **silent auto-accept, no terminal required.** An
+  untrusted one → a prompt headed `signed by <principal>, key <fingerprint>`
+  offering `[y]es once / [t]rust key / [N]o`, where `t` accepts *and* stores the
+  fingerprint so future signed changes stop prompting.
+
+The policy file also carries `default = "prompt" | "decline"` (absent ⇒
+`prompt`). `decline` is for locked-down machines: if no *trusted* signature
+verifies, hooks are skipped with a stderr notice and **no prompt is ever
+shown** — the machine runs only hooks signed by a pre-approved key.
+
+### Key rotation
+
+Trust is bound to a key's fingerprint, not to a person or an email. Rotating to
+a new key produces a **new fingerprint**, which is not yet trusted anywhere — so
+the next signed change re-prompts (or, under `decline` policy, is skipped) until
+someone trusts the new fingerprint or the org adds it to `policy.toml`. This is
+the correct, conservative behavior: a new key is a new thing to vouch for.
+`git hooks untrust <fingerprint>` (add `--global` for the policy file) revokes a
+key you no longer trust.
+
+### Threat model — say it plainly
+
+Signed trust moves the boundary from "content" to "key". That buys enormous UX
+but concentrates risk: **a compromised maintainer signing key is game over.**
+Whoever holds that private key can sign arbitrary hooks, and every machine that
+trusts its fingerprint will auto-accept and run them with no prompt — exactly
+the silent-code-execution outcome this whole tool exists to prevent. There is no
+sandbox behind the signature; trust *is* the boundary.
+
+Mitigations are operational, not magic: keep signing keys on hardware tokens,
+scope who can sign, and treat `git hooks untrust` / removing the key from
+`policy.toml` as the revocation path the moment a key is suspected compromised.
+Until a key is untrusted everywhere it is trusted, it is fully authoritative.
+Everything under [*What the consent hash does NOT cover*](#what-the-consent-hash-does-not-cover)
+still applies on top of this — a signature vouches for the committed hook
+*content*, never for the `$PATH` binaries, network endpoints, or runtime-referenced
+repo files those hooks may reach.
+
 ## No-TTY behavior (safe-off)
 
 With no controlling terminal, `git-hooks` cannot ask, so it does not run.

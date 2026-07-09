@@ -30,8 +30,6 @@ const CONFIG_FILE: &str = ".githooks.toml";
 // with this prefix runs the named script (still via `sh -c`, so args and shell
 // substitution keep working). Everything under it is hash-covered.
 const HOOKS_DIR: &str = ".githooks";
-// Dir component of the consent hash when there is no {HOOKS_DIR}.
-const NO_DIR: &str = "none";
 // Marker line in every shim we write, so `init` can tell our shims from a
 // foreign hook it must not clobber.
 const SHIM_MARKER: &str = "# git-hooks shim";
@@ -49,6 +47,10 @@ fn main() {
         Some("accept") => consent(true),
         Some("decline") => consent(false),
         Some("status") => status(),
+        Some("diff") => diff(),
+        Some("sign") => sign(&args[1..]),
+        Some("trust") => trust_cmd(&args[1..]),
+        Some("untrust") => untrust_cmd(&args[1..]),
         Some("run") => {
             let hook = args.get(1).unwrap_or_else(|| usage());
             exit(run_hook(hook, &args[2..]));
@@ -67,11 +69,19 @@ fn usage() -> ! {
          add <hook> <command>     add a command to this repo's {CONFIG_FILE}\n\
          accept | decline         record your decision for this repo's hooks\n\
          status                   show configured hooks and your decision\n\
+         diff                     show what changed since you last accepted\n\
+         sign --key <path> [--signer <principal>]\n\
+         \x20                        sign the current hooks with an ssh key (maintainer)\n\
+         trust <fingerprint> [--global]\n\
+         \x20                        trust a signing key (repo-local, or org policy)\n\
+         untrust <fingerprint> [--global]   stop trusting a signing key\n\
          run <hook> [args...]     (called by the shims)\n\
          \n\
          hooks are inline commands in {CONFIG_FILE}, or scripts committed under\n\
          {HOOKS_DIR}/ (reference them with a command like `{HOOKS_DIR}/check.sh`).\n\
-         consent is keyed to the content of both; any byte change re-prompts."
+         consent is keyed to the content of both; any byte change re-prompts.\n\
+         a maintainer can `sign` the hooks so cloners who `trust` the key never\n\
+         get prompted while the signature stays valid."
     );
     exit(2);
 }
@@ -274,9 +284,33 @@ fn status() {
                 _ => "no decision yet — will prompt on first hook",
             };
             println!("\nstatus: {state}");
+            println!("{}", signature_line(&root));
         }
         Err(_) => println!("no {CONFIG_FILE} in this repository"),
     }
+}
+
+/// `git hooks diff`: show what changed since the last accept (the same diff the
+/// re-prompt would show), plus the current signature status.
+fn diff() {
+    let root = repo_root().unwrap_or_else(|| {
+        eprintln!("not inside a git repository");
+        exit(1);
+    });
+    if consent_hash().is_none() {
+        println!("no {CONFIG_FILE} in this repository");
+        return;
+    }
+    let manifest = read_manifest();
+    if manifest.is_empty() {
+        println!("nothing accepted yet.");
+    } else if consent_state().as_deref() == Some(format!("accept:{}", consent_hash().unwrap()).as_str())
+    {
+        println!("unchanged since your last accept.");
+    } else {
+        print!("{}", change_prompt_body(&root, &manifest));
+    }
+    println!("{}", signature_line(&root));
 }
 
 /// A single hook command: either a plain string or an inline table
@@ -363,7 +397,7 @@ fn run_hook(hook: &str, hook_args: &[String]) -> i32 {
         None => match consent_state().as_deref() {
             Some(s) if s == format!("accept:{hash}") => true,
             Some(s) if s == format!("decline:{hash}") => return 0,
-            _ => prompt_consent(&root, &raw),
+            _ => resolve_new_consent(&root, &raw),
         },
     };
     if !proceed {
@@ -495,6 +529,35 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     m(pattern.as_bytes(), text.as_bytes())
 }
 
+/// No env override and no stored decision for the current content: resolve via
+/// signed trust, then org policy, then an interactive prompt.
+///
+/// A signature by an already-trusted key auto-accepts with no prompt and no
+/// terminal (the whole point — kills prompt fatigue org-wide). A `decline`
+/// policy default then skips silently. Otherwise we fall through to the prompt,
+/// whose header/choices adapt to the signature status.
+fn resolve_new_consent(root: &Path, raw: &str) -> bool {
+    let trust = signature_status(root);
+    if let Trust::Valid { principal, fingerprint } = &trust {
+        if key_trusted(fingerprint) {
+            record_consent(true);
+            eprintln!(
+                "git-hooks: hooks auto-accepted: signed by trusted key {fingerprint} ({principal})"
+            );
+            return true;
+        }
+    }
+    // Locked-down machines: never prompt, skip untrusted/unsigned repos. Needs
+    // no terminal. A trusted signature was already handled above.
+    if policy_default_decline() {
+        eprintln!(
+            "git-hooks: org policy default is `decline` and no trusted signature — skipping hooks."
+        );
+        return false;
+    }
+    prompt_consent(root, raw, &trust)
+}
+
 /// Ask on the controlling terminal (hook stdin belongs to git; the console
 /// device — /dev/tty on unix, CONIN$/CONOUT$ on Windows — is the standard way
 /// to reach the user). No console — e.g. CI — means no consent: hooks are
@@ -503,7 +566,12 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// First-ever prompt shows the full config + covered scripts. If a previous
 /// accept exists (a manifest), the hooks *changed*: we show a diff against the
 /// accepted version instead of dumping everything again.
-fn prompt_consent(root: &Path, raw: &str) -> bool {
+///
+/// The signature status shapes the prompt: a valid-but-untrusted signature adds
+/// a "signed by …" header and a third `[t]rust key` choice (accept AND remember
+/// the key), an invalid signature adds a loud warning line, and an unsigned repo
+/// keeps the original two-choice prompt byte-for-byte.
+fn prompt_consent(root: &Path, raw: &str, trust: &Trust) -> bool {
     let (in_dev, out_dev) = tty_devices();
     let Ok(tty_in) = fs::File::open(in_dev) else {
         eprintln!(
@@ -522,18 +590,47 @@ fn prompt_consent(root: &Path, raw: &str) -> bool {
     };
     let warning = runtime_ref_warning(root);
 
+    let (header, offer_trust, sig_warn) = match trust {
+        Trust::Valid { principal, fingerprint } => (
+            format!("signed by {principal}, key {fingerprint}\n\n"),
+            true,
+            String::new(),
+        ),
+        Trust::Invalid => (
+            String::new(),
+            false,
+            "signature present but INVALID — do not accept unless you understand why.\n"
+                .to_string(),
+        ),
+        Trust::Unsigned => (String::new(), false, String::new()),
+    };
+    let choices = if offer_trust {
+        "[y]es once / [t]rust key / [N]o "
+    } else {
+        "accept? [y/N] "
+    };
+
     writeln!(
         tty_out,
-        "\n{body}\n\
+        "\n{header}{body}\n\
          these commands will run on your machine during git operations.\n\
-         {warning}accept? [y/N] "
+         {sig_warn}{warning}{choices}"
     )
     .unwrap();
 
     let mut answer = String::new();
     BufReader::new(tty_in).read_line(&mut answer).unwrap();
-    let accepted = matches!(answer.trim(), "y" | "Y" | "yes");
+    let (accepted, trust_key) = match answer.trim() {
+        "t" | "T" if offer_trust => (true, true),
+        "y" | "Y" | "yes" => (true, false),
+        _ => (false, false),
+    };
     record_consent(accepted);
+    if trust_key {
+        if let Trust::Valid { fingerprint, .. } = trust {
+            add_local_trusted_key(fingerprint);
+        }
+    }
     writeln!(
         tty_out,
         "{}. change your mind anytime: `git hooks accept` / `git hooks decline`.",
@@ -710,29 +807,45 @@ fn consent_state() -> Option<String> {
     git_capture(&["config", "--local", "hooks.consent"])
 }
 
-/// Content hash covering everything executable: `git hash-object` of the config
-/// combined with a deterministic hash of the {HOOKS_DIR}/ tree. Any byte change
-/// in either flips it. git computes the object hashes for us, no crypto dep.
+/// Content hash covering everything executable: `git hash-object` the config
+/// and every file under {HOOKS_DIR}/ (INCLUDING trust/), then hash the whole
+/// canonical byte string. Any byte change anywhere flips it. git computes the
+/// object hashes for us, no crypto dep. A signature under trust/ therefore
+/// re-keys consent — fine, it just means "re-accept the newly-signed content".
 fn consent_hash() -> Option<String> {
     let root = repo_root()?;
-    let toml = git_capture(&["hash-object", root.join(CONFIG_FILE).to_str().unwrap()])?;
-    Some(format!("{toml}-{}", githooks_dir_hash(&root)))
+    if !root.join(CONFIG_FILE).is_file() {
+        return None;
+    }
+    Some(git_hash_stdin(&canonical_content(&root, false)))
 }
 
-/// Deterministic hash of the working-tree contents of {HOOKS_DIR}/ (not the
-/// index): walk recursively in sorted order, `git hash-object` each file, then
-/// hash the concatenated "path:blob" lines. No dir → a fixed sentinel.
-fn githooks_dir_hash(root: &Path) -> String {
-    let files = githooks_dir_files(root);
-    if files.is_empty() {
-        return NO_DIR.to_string();
+/// The one deterministic byte string that both consent hashing and signing
+/// cover: a `<relpath>:<blob>` line for {CONFIG_FILE}, then one per file under
+/// {HOOKS_DIR}/ walked in sorted order, so it captures everything the consent
+/// hash covers. `git hash-object` supplies the blob ids (no crypto dep).
+///
+/// When `exclude_trust` is set, files under {HOOKS_DIR}/trust/ are omitted. The
+/// signature is computed over the excluded form because trust/ is where the
+/// signature itself lives — signing over its own output would invalidate it the
+/// moment it is written (see SECURITY.md). Consent hashing passes `false` and
+/// covers trust/ too.
+fn canonical_content(root: &Path, exclude_trust: bool) -> String {
+    let mut s = String::new();
+    let toml = root.join(CONFIG_FILE);
+    if let Some(blob) = git_capture(&["hash-object", toml.to_str().unwrap()]) {
+        s.push_str(&format!("{CONFIG_FILE}:{blob}\n"));
     }
-    let mut manifest = String::new();
-    for f in &files {
+    let trust_prefix = format!("{HOOKS_DIR}/trust/");
+    for f in githooks_dir_files(root) {
+        let relpath = rel(root, &f);
+        if exclude_trust && relpath.starts_with(&trust_prefix) {
+            continue;
+        }
         let blob = git_capture(&["hash-object", f.to_str().unwrap()]).unwrap_or_default();
-        manifest.push_str(&format!("{}:{}\n", rel(root, f), blob));
+        s.push_str(&format!("{relpath}:{blob}\n"));
     }
-    git_hash_stdin(&manifest)
+    s
 }
 
 /// Files under {HOOKS_DIR}/, recursive, sorted for determinism.
@@ -773,6 +886,405 @@ fn repo_root() -> Option<PathBuf> {
 fn git_diff_blob_file(old_blob: &str, path: &Path) -> String {
     let new_blob = git_capture(&["hash-object", "-w", path.to_str().unwrap()]).unwrap_or_default();
     git_capture(&["--no-pager", "diff", old_blob, &new_blob]).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Signed trust (M3). A maintainer signs the canonical content with an ssh key
+// (`sign`); the signature + allowed_signers live under {HOOKS_DIR}/trust/. A
+// cloner who trusts the signing key's fingerprint (repo-local `hooks.trustedKey`
+// or the org policy file) gets prompt-less auto-accept. Namespace is pinned to
+// exactly "git-hooks" so a signature made for another tool cannot be replayed.
+// ---------------------------------------------------------------------------
+
+const SIG_NAMESPACE: &str = "git-hooks";
+
+/// Result of checking the repo's signature against its allowed_signers.
+enum Trust {
+    /// No signature files present — behave exactly as an unsigned repo.
+    Unsigned,
+    /// Signature files present but nothing verifies (tampered/mismatched).
+    Invalid,
+    /// A principal in allowed_signers verified the canonical content.
+    Valid { principal: String, fingerprint: String },
+}
+
+fn trust_dir(root: &Path) -> PathBuf {
+    root.join(HOOKS_DIR).join("trust")
+}
+
+/// Verify {HOOKS_DIR}/trust/hooks.sig against allowed_signers over the canonical
+/// content (EXCLUDING trust/). Try each principal until one verifies.
+fn signature_status(root: &Path) -> Trust {
+    let dir = trust_dir(root);
+    let sig = dir.join("hooks.sig");
+    let signers = dir.join("allowed_signers");
+    if !sig.is_file() || !signers.is_file() {
+        return Trust::Unsigned;
+    }
+    let content = canonical_content(root, true);
+    for principal in allowed_principals(&signers) {
+        if ssh_verify(&signers, &principal, &sig, &content) {
+            let fingerprint = signing_fingerprint(&signers, &principal);
+            return Trust::Valid {
+                principal,
+                fingerprint,
+            };
+        }
+    }
+    Trust::Invalid
+}
+
+/// One human-readable signature line for `status` / `diff`.
+fn signature_line(root: &Path) -> String {
+    match signature_status(root) {
+        Trust::Unsigned => "signature: unsigned".to_string(),
+        Trust::Invalid => "signature: present but INVALID".to_string(),
+        Trust::Valid {
+            principal,
+            fingerprint,
+        } => {
+            let t = if key_trusted(&fingerprint) {
+                "trusted"
+            } else {
+                "untrusted"
+            };
+            format!("signature: signed by {principal}, key {fingerprint} — valid, {t}")
+        }
+    }
+}
+
+/// Principals from an allowed_signers file: first field of each non-comment,
+/// non-empty line, split on `,` (a line may list several principals).
+fn allowed_principals(signers: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(signers) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let first = line.split_whitespace().next().unwrap_or("");
+        for p in first.split(',') {
+            if !p.is_empty() {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `ssh-keygen -Y verify` with the namespace pinned, feeding the canonical
+/// content on stdin. Success (exit 0) means this principal signed this content.
+fn ssh_verify(signers: &Path, principal: &str, sig: &Path, content: &str) -> bool {
+    let child = Command::new("ssh-keygen")
+        .args([
+            "-Y",
+            "verify",
+            "-f",
+            signers.to_str().unwrap(),
+            "-I",
+            principal,
+            "-n",
+            SIG_NAMESPACE,
+            "-s",
+            sig.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return false };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(content.as_bytes());
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+/// SHA256 fingerprint of the key that a principal maps to in allowed_signers.
+fn signing_fingerprint(signers: &Path, principal: &str) -> String {
+    let Ok(text) = fs::read_to_string(signers) else {
+        return String::new();
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.splitn(2, char::is_whitespace);
+        let first = it.next().unwrap_or("");
+        if !first.split(',').any(|p| p == principal) {
+            continue;
+        }
+        let keypart = it.next().unwrap_or("").trim();
+        if !keypart.is_empty() {
+            return fingerprint_of_pubkey(keypart);
+        }
+    }
+    String::new()
+}
+
+/// SHA256 fingerprint of a public key line (`<keytype> <base64> [comment]`) via
+/// `ssh-keygen -lf -`. Output is `<bits> SHA256:… <comment> (<TYPE>)`; the
+/// fingerprint is the second whitespace field.
+fn fingerprint_of_pubkey(pubkey: &str) -> String {
+    let child = Command::new("ssh-keygen")
+        .args(["-lf", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return String::new();
+    };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(pubkey.as_bytes());
+        let _ = si.write_all(b"\n");
+    }
+    let Ok(out) = child.wait_with_output() else {
+        return String::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Is this fingerprint trusted? Org policy first, then repo-local config.
+fn key_trusted(fingerprint: &str) -> bool {
+    if fingerprint.is_empty() {
+        return false;
+    }
+    policy_trusted_keys().iter().any(|k| k == fingerprint)
+        || local_trusted_keys().iter().any(|k| k == fingerprint)
+}
+
+fn local_trusted_keys() -> Vec<String> {
+    git_capture(&["config", "--local", "--get-all", "hooks.trustedKey"])
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn add_local_trusted_key(fingerprint: &str) {
+    if !local_trusted_keys().iter().any(|k| k == fingerprint) {
+        git(&["config", "--local", "--add", "hooks.trustedKey", fingerprint]);
+    }
+}
+
+// --- org policy file: ~/.config/git-hooks/policy.toml ---------------------
+
+fn policy_path() -> PathBuf {
+    home().join(".config/git-hooks/policy.toml")
+}
+
+fn policy() -> toml::Table {
+    fs::read_to_string(policy_path())
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default()
+}
+
+fn policy_trusted_keys() -> Vec<String> {
+    policy()
+        .get("trusted_keys")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn policy_default_decline() -> bool {
+    policy().get("default").and_then(|v| v.as_str()) == Some("decline")
+}
+
+fn write_policy(p: &toml::Table) {
+    let path = policy_path();
+    fs::create_dir_all(path.parent().unwrap()).expect("create policy dir");
+    fs::write(&path, toml::to_string(p).unwrap()).expect("write policy");
+}
+
+// --- commands -------------------------------------------------------------
+
+/// `git hooks sign --key <path> [--signer <principal>]`: sign the canonical
+/// content (EXCLUDING trust/) with an ssh key, writing the armored signature to
+/// {HOOKS_DIR}/trust/hooks.sig and ensuring the signer's public key is in
+/// {HOOKS_DIR}/trust/allowed_signers. Prints the key fingerprint and a reminder.
+fn sign(args: &[String]) {
+    let mut key: Option<String> = None;
+    let mut signer: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--key" => {
+                key = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--signer" => {
+                signer = args.get(i + 1).cloned();
+                i += 2;
+            }
+            _ => usage(),
+        }
+    }
+    let key = key.unwrap_or_else(|| usage());
+    let root = repo_root().unwrap_or_else(|| {
+        eprintln!("not inside a git repository");
+        exit(1);
+    });
+    if !root.join(CONFIG_FILE).is_file() {
+        eprintln!("no {CONFIG_FILE} to sign in this repository");
+        exit(1);
+    }
+
+    // Sign the exact content the cloner will verify (trust/ excluded so writing
+    // the signature below does not invalidate it).
+    let content = canonical_content(&root, true);
+    let signature = ssh_sign(&key, &content);
+
+    let dir = trust_dir(&root);
+    fs::create_dir_all(&dir).expect("create trust dir");
+    fs::write(dir.join("hooks.sig"), &signature).expect("write signature");
+
+    let principal = signer
+        .or_else(|| git_capture(&["config", "user.email"]))
+        .unwrap_or_else(|| {
+            eprintln!("no --signer given and git user.email is unset");
+            exit(1);
+        });
+    let pubkey = ssh_capture(&["-y", "-f", &key]).unwrap_or_else(|| {
+        eprintln!("could not read public key from {key}");
+        exit(1);
+    });
+    let line = format!("{principal} {pubkey}");
+    let signers_path = dir.join("allowed_signers");
+    let existing = fs::read_to_string(&signers_path).unwrap_or_default();
+    if !existing.lines().any(|l| l.trim() == line.trim()) {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&signers_path)
+            .expect("open allowed_signers");
+        writeln!(f, "{line}").expect("append allowed_signers");
+    }
+
+    let fingerprint = ssh_capture(&["-lf", &key])
+        .and_then(|s| s.split_whitespace().nth(1).map(String::from))
+        .unwrap_or_default();
+    println!("signed {CONFIG_FILE} + {HOOKS_DIR}/ (excluding trust/) as {principal}");
+    println!("signing key fingerprint: {fingerprint}");
+    println!("commit {HOOKS_DIR}/trust/ so cloners who trust this key are never prompted.");
+}
+
+/// `git hooks trust <fingerprint> [--global]`.
+fn trust_cmd(args: &[String]) {
+    let (fingerprint, global) = parse_trust_args(args);
+    if global {
+        let mut p = policy();
+        let arr = p
+            .entry("trusted_keys")
+            .or_insert_with(|| toml::Value::Array(vec![]))
+            .as_array_mut()
+            .expect("trusted_keys must be an array");
+        if !arr.iter().any(|v| v.as_str() == Some(fingerprint.as_str())) {
+            arr.push(fingerprint.clone().into());
+        }
+        write_policy(&p);
+        println!("globally trusted signing key {fingerprint} ({})", policy_path().display());
+    } else {
+        if repo_root().is_none() {
+            eprintln!("not inside a git repository (use --global for the org policy file)");
+            exit(1);
+        }
+        add_local_trusted_key(&fingerprint);
+        println!("trusted signing key {fingerprint} for this repository.");
+    }
+}
+
+/// `git hooks untrust <fingerprint> [--global]`.
+fn untrust_cmd(args: &[String]) {
+    let (fingerprint, global) = parse_trust_args(args);
+    if global {
+        let mut p = policy();
+        if let Some(arr) = p.get_mut("trusted_keys").and_then(|v| v.as_array_mut()) {
+            arr.retain(|v| v.as_str() != Some(fingerprint.as_str()));
+        }
+        write_policy(&p);
+        println!("removed {fingerprint} from global trust.");
+    } else {
+        if repo_root().is_none() {
+            eprintln!("not inside a git repository (use --global for the org policy file)");
+            exit(1);
+        }
+        // Rewrite the multi-valued key without the removed fingerprint (avoids
+        // regex-escaping the SHA256 value for `--unset`).
+        let remaining: Vec<String> = local_trusted_keys()
+            .into_iter()
+            .filter(|k| k != &fingerprint)
+            .collect();
+        let _ = git_capture(&["config", "--local", "--unset-all", "hooks.trustedKey"]);
+        for k in &remaining {
+            git(&["config", "--local", "--add", "hooks.trustedKey", k]);
+        }
+        println!("untrusted {fingerprint} for this repository.");
+    }
+}
+
+/// Parse `<fingerprint> [--global]` in any order.
+fn parse_trust_args(args: &[String]) -> (String, bool) {
+    let mut fingerprint: Option<String> = None;
+    let mut global = false;
+    for a in args {
+        if a == "--global" {
+            global = true;
+        } else if fingerprint.is_none() {
+            fingerprint = Some(a.clone());
+        } else {
+            usage();
+        }
+    }
+    (fingerprint.unwrap_or_else(|| usage()), global)
+}
+
+/// `ssh-keygen -Y sign -f <key> -n git-hooks`, content on stdin → armored
+/// signature on stdout.
+fn ssh_sign(key: &str, content: &str) -> String {
+    let child = Command::new("ssh-keygen")
+        .args(["-Y", "sign", "-f", key, "-n", SIG_NAMESPACE])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = child.unwrap_or_else(|e| {
+        eprintln!("could not run ssh-keygen: {e}");
+        exit(1);
+    });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(content.as_bytes())
+        .expect("write to ssh-keygen");
+    let out = child.wait_with_output().expect("wait ssh-keygen");
+    if !out.status.success() {
+        eprintln!(
+            "ssh-keygen sign failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        exit(1);
+    }
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn ssh_capture(args: &[&str]) -> Option<String> {
+    let out = Command::new("ssh-keygen").args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn git_hash_stdin(data: &str) -> String {

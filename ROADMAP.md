@@ -39,11 +39,11 @@ The current hole: consent hashes `.githooks.toml`, but a command like
 
 ## M3 — differentiators (features nobody has)
 
-- [ ] **Signed trust**: maintainer signs `.githooks.toml` (ssh-keygen -Y, key
+- [x] **Signed trust**: maintainer signs `.githooks.toml` (ssh-keygen -Y, key
       committed or in allowed_signers). User trusts the *key* once; config
       changes signed by it stop prompting. Kills prompt fatigue org-wide.
-- [ ] `git hooks diff` — what changed since I last accepted.
-- [ ] Team policy file (`~/.config/git-hooks/policy.toml`): pre-trusted keys,
+- [x] `git hooks diff` — what changed since I last accepted.
+- [x] Team policy file (`~/.config/git-hooks/policy.toml`): pre-trusted keys,
       always-decline patterns, org defaults.
 
 ## M4 — distribution

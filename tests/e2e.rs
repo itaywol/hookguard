@@ -139,6 +139,44 @@ impl Sandbox {
         fs::write(work.join(fname), content).unwrap();
         self.git_in(&["add", fname], work);
     }
+
+    /// Generate a throwaway ed25519 signing key in the sandbox.
+    fn keygen(&self) -> PathBuf {
+        let key = self.root.join("signing_key");
+        let o = self.run_in(
+            "ssh-keygen",
+            &["-t", "ed25519", "-N", "", "-f", key.to_str().unwrap(), "-q"],
+            &self.home,
+        );
+        assert!(o.status.success(), "keygen failed: {}", err(&o));
+        key
+    }
+
+    /// SHA256 fingerprint of a key (the `SHA256:…` field of `ssh-keygen -lf`).
+    fn fingerprint(&self, key: &Path) -> String {
+        let o = self.run_in("ssh-keygen", &["-lf", key.to_str().unwrap()], &self.home);
+        assert!(o.status.success(), "fingerprint failed: {}", err(&o));
+        out(&o).split_whitespace().nth(1).unwrap().to_string()
+    }
+
+    /// Sign the origin repo's hooks with `key` and commit the trust/ dir.
+    fn sign_origin(&self, origin: &Path, key: &Path, signer: &str) {
+        let o = self.hooks_in(
+            &["sign", "--key", key.to_str().unwrap(), "--signer", signer],
+            origin,
+        );
+        assert!(o.status.success(), "sign failed: {}", err(&o));
+        self.git_in(&["add", "-A"], origin);
+        let c = self.git_in(&["commit", "-m", "sign", "--no-verify"], origin);
+        assert!(c.status.success(), "sign commit failed: {}", err(&c));
+    }
+
+    /// Write the org policy file into the fake HOME.
+    fn write_policy(&self, body: &str) {
+        let dir = self.home.join(".config/git-hooks");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("policy.toml"), body).unwrap();
+    }
 }
 
 impl Drop for Sandbox {
@@ -509,5 +547,188 @@ fn add_accepts_new_hook_name() {
         out(&st).contains("pre-merge-commit"),
         "status should list the new hook: {}",
         out(&st)
+    );
+}
+
+// M3: a repo signed by a key pre-trusted in the org policy file auto-accepts on
+// clone with NO prompt and NO terminal — the prompt-fatigue killer.
+#[test]
+fn signed_and_policy_trusted_auto_accepts() {
+    let sb = Sandbox::new();
+    sb.install();
+    let key = sb.keygen();
+    let fp = sb.fingerprint(&key);
+    let origin = sb.make_origin("[hooks]\npre-commit = [\"touch ran.marker\"]\n", &[]);
+    sb.sign_origin(&origin, &key, "maint@example.com");
+    // Org pre-seeds the trusted key before the developer ever clones.
+    sb.write_policy(&format!("trusted_keys = [\"{fp}\"]\n"));
+
+    // Clone fires post-checkout, which auto-accepts with no tty and no prompt.
+    let work = sb.root.join("work");
+    let cl = sb.git_in(
+        &["clone", origin.to_str().unwrap(), work.to_str().unwrap()],
+        &sb.root,
+    );
+    assert!(cl.status.success(), "clone failed: {}", err(&cl));
+    assert!(
+        err(&cl).contains("auto-accepted"),
+        "expected prompt-less auto-accept notice on clone: {}",
+        err(&cl)
+    );
+
+    let st = sb.hooks_in(&["status"], &work);
+    assert!(
+        out(&st).contains("accepted") && out(&st).contains("trusted"),
+        "clone should be auto-accepted and key trusted: {}",
+        out(&st)
+    );
+
+    // And the hook actually runs on commit (consent already recorded, no prompt).
+    sb.stage(&work, "a.txt", "1\n");
+    let c = sb.git_in(&["commit", "-m", "c"], &work);
+    assert!(c.status.success(), "commit failed: {}", err(&c));
+    assert!(
+        work.join("ran.marker").exists(),
+        "trusted-signed hook should run: {}",
+        err(&c)
+    );
+}
+
+// M3: pressing `t`rust is equivalent to `git hooks trust <fp>` repo-locally;
+// afterwards the signed repo auto-accepts on the next hook without a tty.
+#[test]
+fn trust_key_locally_then_auto_accepts() {
+    let sb = Sandbox::new();
+    sb.install();
+    let key = sb.keygen();
+    let fp = sb.fingerprint(&key);
+    let origin = sb.make_origin("[hooks]\npre-commit = [\"touch ran.marker\"]\n", &[]);
+    sb.sign_origin(&origin, &key, "maint@example.com");
+    let work = sb.clone(&origin, "work");
+
+    let t = sb.hooks_in(&["trust", &fp], &work);
+    assert!(t.status.success(), "trust failed: {}", err(&t));
+
+    sb.stage(&work, "a.txt", "1\n");
+    let c = sb.git_in(&["commit", "-m", "c"], &work);
+    assert!(c.status.success(), "commit failed: {}", err(&c));
+    assert!(
+        work.join("ran.marker").exists(),
+        "locally-trusted signed hook should auto-run: {}",
+        err(&c)
+    );
+}
+
+// M3: tampering with a .githooks/ script after signing invalidates the
+// signature. Even with the key trusted, an invalid signature never auto-accepts;
+// with no tty the hook is skipped, and status reports INVALID.
+#[test]
+fn tampered_signature_never_auto_accepts() {
+    let sb = Sandbox::new();
+    sb.install();
+    let key = sb.keygen();
+    let fp = sb.fingerprint(&key);
+    let origin = sb.make_origin(
+        "[hooks]\npre-commit = [\".githooks/hook.sh\"]\n",
+        &[(".githooks/hook.sh", "#!/bin/sh\ntouch ran.marker\n")],
+    );
+    sb.sign_origin(&origin, &key, "maint@example.com");
+    let work = sb.clone(&origin, "work");
+    sb.hooks_in(&["trust", &fp], &work);
+
+    // Tamper AFTER signing: the signed content no longer matches.
+    write_script(
+        &work.join(".githooks/hook.sh"),
+        "#!/bin/sh\n# injected\ntouch ran.marker\n",
+    );
+
+    let st = sb.hooks_in(&["status"], &work);
+    assert!(
+        out(&st).contains("INVALID"),
+        "status should report INVALID: {}",
+        out(&st)
+    );
+
+    sb.stage(&work, "a.txt", "1\n");
+    let c = sb.git_in(&["commit", "-m", "c"], &work);
+    assert!(
+        c.status.success(),
+        "commit should pass (hook skipped): {}",
+        err(&c)
+    );
+    assert!(
+        !work.join("ran.marker").exists(),
+        "tampered signature must not auto-accept even with a trusted key"
+    );
+}
+
+// M3: an unsigned repo reports `unsigned` and its consent flow is unchanged.
+#[test]
+fn unsigned_repo_status_reports_unsigned() {
+    let sb = Sandbox::new();
+    sb.install();
+    let origin = sb.make_origin("[hooks]\npre-commit = [\"true\"]\n", &[]);
+    let work = sb.clone(&origin, "work");
+    let st = sb.hooks_in(&["status"], &work);
+    assert!(
+        out(&st).contains("signature: unsigned"),
+        "unsigned repo should report unsigned: {}",
+        out(&st)
+    );
+}
+
+// M3: org policy `default = "decline"` skips hooks in an unsigned/untrusted repo
+// with no prompt and no tty — a failing hook never runs, the commit passes.
+#[test]
+fn policy_default_decline_skips_silently() {
+    let sb = Sandbox::new();
+    sb.install();
+    let origin = sb.make_origin("[hooks]\npre-commit = [\"exit 1\"]\n", &[]);
+    let work = sb.clone(&origin, "work");
+    sb.write_policy("default = \"decline\"\n");
+
+    sb.stage(&work, "a.txt", "1\n");
+    let c = sb.git_in(&["commit", "-m", "c"], &work);
+    assert!(
+        c.status.success(),
+        "decline policy must skip the failing hook: {}",
+        err(&c)
+    );
+    assert!(
+        err(&c).contains("decline"),
+        "expected a policy-decline notice: {}",
+        err(&c)
+    );
+    assert!(
+        !err(&c).contains("FAILED"),
+        "hook must not run under decline policy: {}",
+        err(&c)
+    );
+}
+
+// M3: `git hooks diff` shows what changed since the last accept.
+#[test]
+fn diff_shows_change_since_accept() {
+    let sb = Sandbox::new();
+    sb.install();
+    let origin = sb.make_origin(
+        "[hooks]\npre-commit = [\".githooks/hook.sh\"]\n",
+        &[(".githooks/hook.sh", "#!/bin/sh\necho ORIGINAL\n")],
+    );
+    let work = sb.clone(&origin, "work");
+    sb.hooks_in(&["accept"], &work);
+
+    write_script(&work.join(".githooks/hook.sh"), "#!/bin/sh\necho CHANGED\n");
+    let d = sb.hooks_in(&["diff"], &work);
+    assert!(d.status.success(), "diff failed: {}", err(&d));
+    assert!(
+        out(&d).contains("CHANGED"),
+        "diff should contain the change: {}",
+        out(&d)
+    );
+    assert!(
+        out(&d).contains("signature: unsigned"),
+        "diff should show the signature status: {}",
+        out(&d)
     );
 }
