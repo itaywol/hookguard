@@ -29,7 +29,7 @@
 
             meta = with pkgs.lib; {
               description = "Trust-first git hook manager — hooks auto-install on clone, nothing runs without your consent";
-              homepage = "https://github.com/itayw/hookguard";
+              homepage = "https://github.com/itaywol/hookguard";
               license = with licenses; [ mit asl20 ];
               mainProgram = "git-hooks";
             };

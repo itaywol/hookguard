@@ -179,12 +179,12 @@ back to safe-off.
 ```sh
 cargo install hookguard
 cargo binstall hookguard        # prebuilt binary, no compile
-nix run github:itayw/hookguard  # flake, ad hoc
-nix profile install github:itayw/hookguard  # flake, persistent
+nix run github:itaywol/hookguard  # flake, ad hoc
+nix profile install github:itaywol/hookguard  # flake, persistent
 ```
 
 Or grab a prebuilt binary from the
-[releases page](https://github.com/itayw/hookguard/releases) — static musl on
+[releases page](https://github.com/itaywol/hookguard/releases) — static musl on
 Linux, native on macOS and Windows.
 
 ## License
