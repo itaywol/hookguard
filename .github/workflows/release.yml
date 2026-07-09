@@ -35,7 +35,9 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      # Copy the binary to a target-tagged name so assets don't collide.
+      # Copy the binary to a target-and-version-tagged name so assets don't
+      # collide and cargo-binstall's default pkg-url template resolves:
+      # { repo }/releases/download/v{ version }/git-hooks-{ target }-v{ version }{ binary-ext }
       # bash is available on all three runner OSes.
       - name: Package
         shell: bash
@@ -43,7 +45,7 @@ jobs:
           ext=""
           [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
           src="target/${{ matrix.target }}/release/git-hooks${ext}"
-          out="git-hooks-${{ matrix.target }}${ext}"
+          out="git-hooks-${{ matrix.target }}-${{ github.ref_name }}${ext}"
           cp "$src" "$out"
           echo "ASSET=$out" >> "$GITHUB_ENV"
 

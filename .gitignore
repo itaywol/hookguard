@@ -1,2 +1,4 @@
 target/
 .claude/
+result
+result-*

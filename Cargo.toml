@@ -1,7 +1,21 @@
 [package]
-name = "git-hooks"
+name = "hookguard"
 version = "0.1.0"
 edition = "2021"
+description = "Trust-first git hook manager — hooks auto-install on clone, nothing runs without your consent"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/itayw/hookguard"
+readme = "README.md"
+keywords = ["git", "hooks", "git-hooks", "security", "pre-commit"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "git-hooks"
+path = "src/main.rs"
 
 [dependencies]
 toml = "0.8"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/git-hooks-{ target }-v{ version }{ binary-ext }"
+pkg-fmt = "bin"

@@ -29,13 +29,13 @@ The current hole: consent hashes `.githooks.toml`, but a command like
 
 ## M2 — table stakes (parity where absence blocks adoption)
 
-- [ ] `git hooks init` — adopt shims into an already-cloned repo.
-- [ ] Full githooks(5) hook list.
-- [ ] Windows: USERPROFILE, CONIN$/CONOUT$ instead of /dev/tty (git-for-windows ships sh, shims already fine).
-- [ ] Staged-file awareness: `{staged_files}` substitution + glob filter per hook
+- [x] `git hooks init` — adopt shims into an already-cloned repo.
+- [x] Full githooks(5) hook list.
+- [x] Windows: USERPROFILE, CONIN$/CONOUT$ instead of /dev/tty (git-for-windows ships sh, shims already fine).
+- [x] Staged-file awareness: `{staged_files}` substitution + glob filter per hook
       (the one lefthook feature people actually use).
-- [ ] `GIT_HOOKS_CONSENT=accept:<hash>` env override — reproducible CI opt-in.
-- [ ] CI matrix (linux/macos/windows), static musl release builds.
+- [x] `GIT_HOOKS_CONSENT=accept:<hash>` env override — reproducible CI opt-in.
+- [x] CI matrix (linux/macos/windows), static musl release builds.
 
 ## M3 — differentiators (features nobody has)
 
@@ -48,9 +48,11 @@ The current hole: consent hashes `.githooks.toml`, but a command like
 
 ## M4 — distribution
 
-- [ ] Name + crates.io claim (`git-hooks` likely taken/generic — decide before publishing).
-- [ ] cargo-binstall, nix flake, homebrew tap. README with honest comparison table.
-- [ ] MIT OR Apache-2.0.
+- [x] Name + crates.io claim (`git-hooks` was taken/generic — published as `hookguard`,
+      binary stays `git-hooks`).
+- [x] cargo-binstall, nix flake. README with honest comparison table.
+- [ ] homebrew tap (deferred — needs separate tap repo).
+- [x] MIT OR Apache-2.0.
 
 ## Explicitly not doing
 
