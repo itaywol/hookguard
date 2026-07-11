@@ -2,3 +2,10 @@ target/
 .claude/
 result
 result-*
+
+# editor/OS junk
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

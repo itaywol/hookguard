@@ -304,7 +304,8 @@ fn diff() {
     let manifest = read_manifest();
     if manifest.is_empty() {
         println!("nothing accepted yet.");
-    } else if consent_state().as_deref() == Some(format!("accept:{}", consent_hash().unwrap()).as_str())
+    } else if consent_state().as_deref()
+        == Some(format!("accept:{}", consent_hash().unwrap()).as_str())
     {
         println!("unchanged since your last accept.");
     } else {
@@ -422,21 +423,31 @@ fn run_hook(hook: &str, hook_args: &[String]) -> i32 {
     let staged = staged_files(&root);
 
     for cmd in cmds {
-        let Some(hc) = parse_hook_cmd(cmd) else { continue };
+        let Some(hc) = parse_hook_cmd(cmd) else {
+            continue;
+        };
 
         // If a glob is set, gate on (and substitute) only the matching staged
         // files. No glob → all staged files are eligible for substitution.
         let matched: Vec<String> = match &hc.glob {
-            Some(g) => staged.iter().filter(|f| glob_match(g, f)).cloned().collect(),
+            Some(g) => staged
+                .iter()
+                .filter(|f| glob_match(g, f))
+                .cloned()
+                .collect(),
             None => staged.clone(),
         };
         if hc.glob.is_some() && matched.is_empty() {
-            eprintln!("git-hooks[{hook}]: skipped (no matching staged files): {}", hc.run);
+            eprintln!(
+                "git-hooks[{hook}]: skipped (no matching staged files): {}",
+                hc.run
+            );
             continue;
         }
 
         let cmd_str = if hc.run.contains("{staged_files}") {
-            hc.run.replace("{staged_files}", &shell_quote_list(&matched))
+            hc.run
+                .replace("{staged_files}", &shell_quote_list(&matched))
         } else {
             hc.run.clone()
         };
@@ -538,7 +549,11 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// whose header/choices adapt to the signature status.
 fn resolve_new_consent(root: &Path, raw: &str) -> bool {
     let trust = signature_status(root);
-    if let Trust::Valid { principal, fingerprint } = &trust {
+    if let Trust::Valid {
+        principal,
+        fingerprint,
+    } = &trust
+    {
         if key_trusted(fingerprint) {
             record_consent(true);
             eprintln!(
@@ -591,7 +606,10 @@ fn prompt_consent(root: &Path, raw: &str, trust: &Trust) -> bool {
     let warning = runtime_ref_warning(root);
 
     let (header, offer_trust, sig_warn) = match trust {
-        Trust::Valid { principal, fingerprint } => (
+        Trust::Valid {
+            principal,
+            fingerprint,
+        } => (
             format!("signed by {principal}, key {fingerprint}\n\n"),
             true,
             String::new(),
@@ -670,8 +688,10 @@ fn first_prompt_body(root: &Path, raw: &str) -> String {
 /// Re-prompt: the content changed since the last accept. Show what changed as a
 /// diff against the accepted blobs, not the whole file.
 fn change_prompt_body(root: &Path, manifest: &[(String, String)]) -> String {
-    let accepted: BTreeMap<&str, &str> =
-        manifest.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let accepted: BTreeMap<&str, &str> = manifest
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_str()))
+        .collect();
 
     // Currently-relevant files: the toml + everything under .githooks/.
     let mut current: Vec<String> = vec![CONFIG_FILE.to_string()];
@@ -727,7 +747,9 @@ fn runtime_ref_warning(root: &Path) -> String {
         for val in hooks.values() {
             let Some(arr) = val.as_array() else { continue };
             for cmd in arr {
-                let Some(hc) = parse_hook_cmd(cmd) else { continue };
+                let Some(hc) = parse_hook_cmd(cmd) else {
+                    continue;
+                };
                 for tok in hc.run.split_whitespace() {
                     if !(tok.starts_with("./") || tok.contains('/')) {
                         continue;
@@ -857,7 +879,9 @@ fn githooks_dir_files(root: &Path) -> Vec<PathBuf> {
 }
 
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -905,7 +929,10 @@ enum Trust {
     /// Signature files present but nothing verifies (tampered/mismatched).
     Invalid,
     /// A principal in allowed_signers verified the canonical content.
-    Valid { principal: String, fingerprint: String },
+    Valid {
+        principal: String,
+        fingerprint: String,
+    },
 }
 
 fn trust_dir(root: &Path) -> PathBuf {
@@ -1069,7 +1096,13 @@ fn local_trusted_keys() -> Vec<String> {
 
 fn add_local_trusted_key(fingerprint: &str) {
     if !local_trusted_keys().iter().any(|k| k == fingerprint) {
-        git(&["config", "--local", "--add", "hooks.trustedKey", fingerprint]);
+        git(&[
+            "config",
+            "--local",
+            "--add",
+            "hooks.trustedKey",
+            fingerprint,
+        ]);
     }
 }
 
@@ -1194,7 +1227,10 @@ fn trust_cmd(args: &[String]) {
             arr.push(fingerprint.clone().into());
         }
         write_policy(&p);
-        println!("globally trusted signing key {fingerprint} ({})", policy_path().display());
+        println!(
+            "globally trusted signing key {fingerprint} ({})",
+            policy_path().display()
+        );
     } else {
         if repo_root().is_none() {
             eprintln!("not inside a git repository (use --global for the org policy file)");

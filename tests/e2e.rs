@@ -77,7 +77,13 @@ impl Sandbox {
 
     /// Like `run_in`, but with extra environment variables (e.g.
     /// GIT_HOOKS_CONSENT). Same isolated HOME/PATH and detached TTY.
-    fn run_in_env(&self, program: &str, args: &[&str], cwd: &Path, extra: &[(&str, &str)]) -> Output {
+    fn run_in_env(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: &Path,
+        extra: &[(&str, &str)],
+    ) -> Output {
         let path = format!(
             "{}:{}",
             self.bindir.display(),
@@ -261,7 +267,10 @@ fn toml_change_invalidates_consent() {
     sb.stage(&work, "a.txt", "1\n");
     let c1 = sb.git_in(&["commit", "-m", "c1"], &work);
     assert!(c1.status.success(), "c1 failed: {}", err(&c1));
-    assert!(work.join("ran.marker").exists(), "hook should have run on c1");
+    assert!(
+        work.join("ran.marker").exists(),
+        "hook should have run on c1"
+    );
 
     // Change the toml — consent must no longer match.
     fs::write(
@@ -280,7 +289,11 @@ fn toml_change_invalidates_consent() {
     fs::remove_file(work.join("ran.marker")).unwrap();
     sb.stage(&work, "b.txt", "2\n");
     let c2 = sb.git_in(&["commit", "-m", "c2"], &work);
-    assert!(c2.status.success(), "c2 should pass (hook skipped): {}", err(&c2));
+    assert!(
+        c2.status.success(),
+        "c2 should pass (hook skipped): {}",
+        err(&c2)
+    );
     assert!(
         !work.join("ran.marker").exists(),
         "hook must be skipped after toml change without TTY"
@@ -302,7 +315,10 @@ fn script_change_invalidates_consent() {
     sb.stage(&work, "a.txt", "1\n");
     let c1 = sb.git_in(&["commit", "-m", "c1"], &work);
     assert!(c1.status.success(), "c1 failed: {}", err(&c1));
-    assert!(work.join("ran.marker").exists(), "script should have run on c1");
+    assert!(
+        work.join("ran.marker").exists(),
+        "script should have run on c1"
+    );
 
     // Change ONLY the script; the toml is untouched.
     write_script(
@@ -320,7 +336,11 @@ fn script_change_invalidates_consent() {
     fs::remove_file(work.join("ran.marker")).unwrap();
     sb.stage(&work, "b.txt", "2\n");
     let c2 = sb.git_in(&["commit", "-m", "c2"], &work);
-    assert!(c2.status.success(), "c2 should pass (hook skipped): {}", err(&c2));
+    assert!(
+        c2.status.success(),
+        "c2 should pass (hook skipped): {}",
+        err(&c2)
+    );
     assert!(
         !work.join("ran.marker").exists(),
         "script must be skipped after .githooks/ change without TTY"
@@ -455,7 +475,8 @@ fn init_adopts_shims_and_refuses_to_clobber() {
 fn glob_and_staged_files_substitution() {
     let sb = Sandbox::new();
     sb.install();
-    let toml = "[hooks]\npre-commit = [{ run = \"echo {staged_files} > got.txt\", glob = \"*.rs\" }]\n";
+    let toml =
+        "[hooks]\npre-commit = [{ run = \"echo {staged_files} > got.txt\", glob = \"*.rs\" }]\n";
     let origin = sb.make_origin(toml, &[]);
     let work = sb.clone(&origin, "work");
     sb.hooks_in(&["accept"], &work);
@@ -497,7 +518,11 @@ fn env_consent_override() {
     let marker = work.join("ran.marker");
 
     // No stored consent + accept env → hook runs.
-    let o1 = sb.hooks_in_env(&["run", "pre-commit"], &work, &[("GIT_HOOKS_CONSENT", "accept")]);
+    let o1 = sb.hooks_in_env(
+        &["run", "pre-commit"],
+        &work,
+        &[("GIT_HOOKS_CONSENT", "accept")],
+    );
     assert!(o1.status.success(), "run failed: {}", err(&o1));
     assert!(marker.exists(), "accept env should run the hook");
 
@@ -511,7 +536,11 @@ fn env_consent_override() {
 
     // decline env → hook skipped.
     fs::remove_file(&marker).unwrap();
-    let o2 = sb.hooks_in_env(&["run", "pre-commit"], &work, &[("GIT_HOOKS_CONSENT", "decline")]);
+    let o2 = sb.hooks_in_env(
+        &["run", "pre-commit"],
+        &work,
+        &[("GIT_HOOKS_CONSENT", "decline")],
+    );
     assert!(o2.status.success());
     assert!(!marker.exists(), "decline env should skip the hook");
 
@@ -540,7 +569,11 @@ fn add_accepts_new_hook_name() {
     sb.git_in(&["init"], &repo);
 
     let a = sb.hooks_in(&["add", "pre-merge-commit", "true"], &repo);
-    assert!(a.status.success(), "add pre-merge-commit failed: {}", err(&a));
+    assert!(
+        a.status.success(),
+        "add pre-merge-commit failed: {}",
+        err(&a)
+    );
 
     let st = sb.hooks_in(&["status"], &repo);
     assert!(

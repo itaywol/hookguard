@@ -53,3 +53,30 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET }}
+
+  publish-crate:
+    # Publish to crates.io only after every platform build has succeeded.
+    # Skips (rather than fails) when CARGO_TOKEN is not configured, so binary
+    # releases still work while crates.io publishing is unavailable — re-run
+    # the job after adding the secret to publish.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for crates.io token
+        id: token
+        env:
+          CARGO_TOKEN: ${{ secrets.CARGO_TOKEN }}
+        run: |
+          if [ -z "$CARGO_TOKEN" ]; then
+            echo "::warning::CARGO_TOKEN secret is not set — skipping crates.io publish." \
+                 "Add it under Settings → Secrets and variables → Actions, then re-run this job."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to crates.io
+        if: steps.token.outputs.present == 'true'
+        run: cargo publish --token ${{ secrets.CARGO_TOKEN }}
