@@ -134,10 +134,10 @@ ever runs hooks signed by a pre-approved key.
 | Auditable in one sitting | yes (~1 file) | no | no | mostly | mostly | no |
 
 We lose on language environments and the hook ecosystem — pre-commit and
-gabyx/Githooks have spent years on those and we deliberately haven't (see
-"Explicitly not doing" in [ROADMAP.md](ROADMAP.md)). What we bet on instead is
-a consent model with no holes: content-keyed hashing, diffs on every change,
-and signed trust that only ever narrows to a key you explicitly vouched for.
+gabyx/Githooks have spent years on those and we deliberately haven't. What we
+bet on instead is a consent model with no holes: content-keyed hashing, diffs
+on every change, and signed trust that only ever narrows to a key you
+explicitly vouched for.
 
 ## Security model
 

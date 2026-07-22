@@ -300,7 +300,8 @@ fn toml_change_invalidates_consent() {
     );
 }
 
-// .githooks/ script change (toml untouched) -> consent invalidated. THE M1 point.
+// .githooks/ script change (toml untouched) -> consent invalidated. Consent
+// tracks the script's content, not just the toml that references it.
 #[test]
 fn script_change_invalidates_consent() {
     let sb = Sandbox::new();
@@ -559,8 +560,8 @@ fn env_consent_override() {
     );
 }
 
-// The full hook list is wired into `add` validation: a hook new in M2 is
-// accepted.
+// The full hook list is wired into `add` validation: pre-merge-commit is
+// accepted as a valid hook name.
 #[test]
 fn add_accepts_new_hook_name() {
     let sb = Sandbox::new();
@@ -583,7 +584,7 @@ fn add_accepts_new_hook_name() {
     );
 }
 
-// M3: a repo signed by a key pre-trusted in the org policy file auto-accepts on
+// A repo signed by a key pre-trusted in the org policy file auto-accepts on
 // clone with NO prompt and NO terminal — the prompt-fatigue killer.
 #[test]
 fn signed_and_policy_trusted_auto_accepts() {
@@ -627,7 +628,7 @@ fn signed_and_policy_trusted_auto_accepts() {
     );
 }
 
-// M3: pressing `t`rust is equivalent to `git hooks trust <fp>` repo-locally;
+// Pressing `t`rust is equivalent to `git hooks trust <fp>` repo-locally;
 // afterwards the signed repo auto-accepts on the next hook without a tty.
 #[test]
 fn trust_key_locally_then_auto_accepts() {
@@ -652,7 +653,7 @@ fn trust_key_locally_then_auto_accepts() {
     );
 }
 
-// M3: tampering with a .githooks/ script after signing invalidates the
+// Tampering with a .githooks/ script after signing invalidates the
 // signature. Even with the key trusted, an invalid signature never auto-accepts;
 // with no tty the hook is skipped, and status reports INVALID.
 #[test]
@@ -695,7 +696,7 @@ fn tampered_signature_never_auto_accepts() {
     );
 }
 
-// M3: an unsigned repo reports `unsigned` and its consent flow is unchanged.
+// An unsigned repo reports `unsigned` and its consent flow is unchanged.
 #[test]
 fn unsigned_repo_status_reports_unsigned() {
     let sb = Sandbox::new();
@@ -710,7 +711,7 @@ fn unsigned_repo_status_reports_unsigned() {
     );
 }
 
-// M3: org policy `default = "decline"` skips hooks in an unsigned/untrusted repo
+// Org policy `default = "decline"` skips hooks in an unsigned/untrusted repo
 // with no prompt and no tty — a failing hook never runs, the commit passes.
 #[test]
 fn policy_default_decline_skips_silently() {
@@ -739,7 +740,7 @@ fn policy_default_decline_skips_silently() {
     );
 }
 
-// M3: `git hooks diff` shows what changed since the last accept.
+// `git hooks diff` shows what changed since the last accept.
 #[test]
 fn diff_shows_change_since_accept() {
     let sb = Sandbox::new();

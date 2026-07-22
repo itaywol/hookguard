@@ -913,7 +913,7 @@ fn git_diff_blob_file(old_blob: &str, path: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Signed trust (M3). A maintainer signs the canonical content with an ssh key
+// Signed trust. A maintainer signs the canonical content with an ssh key
 // (`sign`); the signature + allowed_signers live under {HOOKS_DIR}/trust/. A
 // cloner who trusts the signing key's fingerprint (repo-local `hooks.trustedKey`
 // or the org policy file) gets prompt-less auto-accept. Namespace is pinned to
